@@ -7,13 +7,13 @@
   - <2 second inference time
   - GDPR & EU AI Act compliant
   - Industrial-grade reliability
+  - Auto-recovery from camera failures
   
   Hardware: ESP32-CAM (AI Thinker)
   Model: Edge Impulse CNN (INT8 quantized)
   
-  Author: [Your Name]
-  Version: 2.0.1
-  Date: January 2026
+  Version: 2.1.0
+  Date: February 2026
 */
 
 #include <Mask_no_mask_inferencing.h>
@@ -55,13 +55,13 @@
 #define LED_GPIO_NUM 4
 
 // Model performance settings
-#define CONFIDENCE_THRESHOLD 0.70        // Increased from 0.60 for bias mitigation
-#define AMBIGUITY_THRESHOLD 0.20         // Flag if mask/nomask difference <20%
+#define CONFIDENCE_THRESHOLD 0.70
+#define AMBIGUITY_THRESHOLD 0.20
 
 // Timing intervals
-#define INFERENCE_INTERVAL 5000          // 5 seconds between inferences
-#define REPORT_INTERVAL 15000            // 15 second violation reports
-#define HEALTH_CHECK_INTERVAL 300000     // 5 minutes
+#define INFERENCE_INTERVAL 5000
+#define REPORT_INTERVAL 15000
+#define HEALTH_CHECK_INTERVAL 300000
 
 // WiFi credentials
 const char* AP_SSID = "Kushal";
@@ -72,7 +72,7 @@ WebServer server(80);
 static bool is_initialised = false;
 uint8_t *snapshot_buf = nullptr;
 
-// Cached detection state (lock-free reads for /status)
+// Cached detection state
 struct DetectionCache {
     String detection = "Unknown";
     float confidence = 0.0;
@@ -83,7 +83,7 @@ struct DetectionCache {
     bool is_ambiguous = false;
 } cache;
 
-// Shared state (protected by mutex)
+// Shared state
 String currentDetection = "Unknown";
 float currentConfidence = 0.0;
 float maskConfidence = 0.0;
@@ -115,7 +115,71 @@ static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-// ==================== GAUSSIAN BLUR (Privacy Protection) ====================
+// ==================== CAMERA INITIALIZATION ====================
+bool initCamera() {
+  camera_config.ledc_channel = LEDC_CHANNEL_0;
+  camera_config.ledc_timer = LEDC_TIMER_0;
+  camera_config.pin_d0 = Y2_GPIO_NUM;
+  camera_config.pin_d1 = Y3_GPIO_NUM;
+  camera_config.pin_d2 = Y4_GPIO_NUM;
+  camera_config.pin_d3 = Y5_GPIO_NUM;
+  camera_config.pin_d4 = Y6_GPIO_NUM;
+  camera_config.pin_d5 = Y7_GPIO_NUM;
+  camera_config.pin_d6 = Y8_GPIO_NUM;
+  camera_config.pin_d7 = Y9_GPIO_NUM;
+  camera_config.pin_xclk = XCLK_GPIO_NUM;
+  camera_config.pin_pclk = PCLK_GPIO_NUM;
+  camera_config.pin_vsync = VSYNC_GPIO_NUM;
+  camera_config.pin_href = HREF_GPIO_NUM;
+  camera_config.pin_sscb_sda = SIOD_GPIO_NUM;
+  camera_config.pin_sscb_scl = SIOC_GPIO_NUM;
+  camera_config.pin_pwdn = PWDN_GPIO_NUM;
+  camera_config.pin_reset = RESET_GPIO_NUM;
+  camera_config.xclk_freq_hz = 20000000;
+  camera_config.pixel_format = PIXFORMAT_JPEG;
+  camera_config.frame_size = FRAMESIZE_QVGA;
+  camera_config.jpeg_quality = 12;
+  camera_config.fb_count = 2;
+  camera_config.fb_location = CAMERA_FB_IN_PSRAM;
+  camera_config.grab_mode = CAMERA_GRAB_LATEST;
+  
+  esp_err_t err = esp_camera_init(&camera_config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, -1);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, 0);
+  s->set_aec_value(s, 300);
+  s->set_gain_ctrl(s, 1);
+  s->set_agc_gain(s, 5);
+  s->set_gainceiling(s, (gainceiling_t)2);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_raw_gma(s, 1);
+  s->set_lenc(s, 1);
+  
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+  }
+  
+  Serial.println("✓ Camera initialized");
+  Serial.printf("  Sensor: %s (0x%02X)\n", 
+                s->id.PID == OV3660_PID ? "OV3660" : "OV2640", s->id.PID);
+  
+  return true;
+}
+
+// ==================== GAUSSIAN BLUR ====================
 void applyGaussianBlur(uint8_t *img, int w, int h, int strength) {
   if (!ENABLE_BLUR || strength < 3) return;
   
@@ -123,11 +187,10 @@ void applyGaussianBlur(uint8_t *img, int w, int h, int strength) {
   int half = k / 2;
   uint8_t *temp = (uint8_t*)malloc(w * h);
   if (!temp) {
-    Serial.println("⚠️ Blur malloc failed - skipping blur");
+    Serial.println("⚠️ Blur malloc failed");
     return;
   }
   
-  // Horizontal pass
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
       int sum = 0, count = 0;
@@ -142,7 +205,6 @@ void applyGaussianBlur(uint8_t *img, int w, int h, int strength) {
     }
   }
   
-  // Vertical pass
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
       int sum = 0, count = 0;
@@ -160,11 +222,9 @@ void applyGaussianBlur(uint8_t *img, int w, int h, int strength) {
   free(temp);
 }
 
-// ==================== BLUR JPEG FRAME (Fixed - No goto across initialization) ====================
 void blurJPEGFrame(camera_fb_t *fb) {
   if (!ENABLE_BLUR || !fb) return;
   
-  // Declare ALL variables at the start
   uint8_t *rgb_buf = NULL;
   uint8_t *r = NULL;
   uint8_t *g = NULL;
@@ -175,27 +235,19 @@ void blurJPEGFrame(camera_fb_t *fb) {
   size_t jpg_len = 0;
   bool success = false;
   
-  // Allocate RGB buffer
   rgb_buf = (uint8_t*)malloc(rgb_len);
-  if (!rgb_buf) {
-    Serial.println("⚠️ RGB buffer malloc failed");
-    return;
-  }
+  if (!rgb_buf) return;
   
-  // Convert to RGB888
   if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb_buf)) {
-    Serial.println("⚠️ RGB888 conversion failed");
     free(rgb_buf);
     return;
   }
   
-  // Allocate channel buffers
   r = (uint8_t*)malloc(pc);
   g = (uint8_t*)malloc(pc);
   b = (uint8_t*)malloc(pc);
   
   if (!r || !g || !b) {
-    Serial.println("⚠️ Channel buffer malloc failed");
     if (r) free(r);
     if (g) free(g);
     if (b) free(b);
@@ -203,31 +255,26 @@ void blurJPEGFrame(camera_fb_t *fb) {
     return;
   }
   
-  // Separate channels
   for (size_t i = 0; i < pc; i++) {
     r[i] = rgb_buf[i*3];
     g[i] = rgb_buf[i*3+1];
     b[i] = rgb_buf[i*3+2];
   }
   
-  // Apply blur to each channel
   applyGaussianBlur(r, fb->width, fb->height, BLUR_STRENGTH);
   applyGaussianBlur(g, fb->width, fb->height, BLUR_STRENGTH);
   applyGaussianBlur(b, fb->width, fb->height, BLUR_STRENGTH);
   
-  // Merge channels
   for (size_t i = 0; i < pc; i++) {
     rgb_buf[i*3] = r[i];
     rgb_buf[i*3+1] = g[i];
     rgb_buf[i*3+2] = b[i];
   }
   
-  // Free channel buffers (no longer needed)
   free(r);
   free(g);
   free(b);
   
-  // Encode to JPEG
   success = fmt2jpg(rgb_buf, rgb_len, fb->width, fb->height, 
                     PIXFORMAT_RGB888, 60, &jpg_buf, &jpg_len);
   
@@ -239,7 +286,6 @@ void blurJPEGFrame(camera_fb_t *fb) {
     if (jpg_buf) free(jpg_buf);
   }
   
-  // Cleanup RGB buffer
   free(rgb_buf);
 }
 
@@ -256,13 +302,42 @@ static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
-  if (!is_initialised) return false;
+  if (!is_initialised) {
+    Serial.println("⚠️ Camera not initialized");
+    return false;
+  }
   
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("⚠️ Camera capture failed");
+    Serial.println("⚠️ Camera capture failed - attempting recovery");
     cameraErrorCount++;
-    return false;
+    
+    // Auto-recovery after 3 failures
+    if (cameraErrorCount >= 3) {
+      Serial.println("🔄 Attempting camera recovery...");
+      esp_camera_deinit();
+      delay(200);
+      if (initCamera()) {
+        Serial.println("✅ Camera recovered");
+        cameraErrorCount = 0;
+      } else {
+        Serial.println("❌ Camera recovery failed");
+        return false;
+      }
+      
+      fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("❌ Still failing after recovery");
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  
+  if (cameraErrorCount > 0) {
+    Serial.println("✓ Camera working again");
+    cameraErrorCount = 0;
   }
   
   bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
@@ -284,11 +359,10 @@ bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf
   return true;
 }
 
-// ==================== MASK DETECTION (Core Algorithm) ====================
+// ==================== MASK DETECTION ====================
 void runMaskDetection() {
   unsigned long start_time = millis();
   
-  // Allocate image buffer
   snapshot_buf = (uint8_t*)malloc(
     EI_CAMERA_RAW_FRAME_BUFFER_COLS * 
     EI_CAMERA_RAW_FRAME_BUFFER_ROWS * 
@@ -301,12 +375,10 @@ void runMaskDetection() {
     return;
   }
   
-  // Setup Edge Impulse signal
   ei::signal_t signal;
   signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
   signal.get_data = &ei_camera_get_data;
   
-  // Capture image
   if (!ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, 
                          (size_t)EI_CLASSIFIER_INPUT_HEIGHT, 
                          snapshot_buf)) {
@@ -315,7 +387,6 @@ void runMaskDetection() {
     return;
   }
   
-  // Run inference
   ei_impulse_result_t result = { 0 };
   EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
   
@@ -327,7 +398,6 @@ void runMaskDetection() {
     return;
   }
   
-  // Parse results
   bool noMaskDetected = false;
   float maxConf = 0.0;
   String detClass = "Unknown";
@@ -349,7 +419,6 @@ void runMaskDetection() {
       detClass = String(ei_classifier_inferencing_categories[i]);
     }
     
-    // INCREASED THRESHOLD for bias mitigation
     if ((label.indexOf("no") >= 0 || label.indexOf("without") >= 0) && 
         result.classification[i].value > CONFIDENCE_THRESHOLD) {
       noMaskDetected = true;
@@ -357,7 +426,6 @@ void runMaskDetection() {
     }
   }
   
-  // Ambiguity detection (for beards, low-light, etc.)
   float confidence_diff = abs(tempMask - tempNoMask);
   bool is_ambiguous = (confidence_diff < AMBIGUITY_THRESHOLD);
   
@@ -365,16 +433,11 @@ void runMaskDetection() {
     Serial.println("\n⚠️ AMBIGUOUS DETECTION:");
     Serial.printf("   Mask: %.1f%%, No Mask: %.1f%% (diff: %.1f%%)\n",
                   tempMask*100, tempNoMask*100, confidence_diff*100);
-    Serial.println("   Possible: beard, glasses, incorrect wearing, poor lighting");
-    Serial.println("   Action: Flagged for human review (no automatic alert)");
-    
-    // Don't trigger alert for ambiguous cases (err on safe side)
     noMaskDetected = false;
   }
   
   inferenceCounter++;
   
-  // Update cache atomically
   if (xSemaphoreTake(detectionMutex, portMAX_DELAY) == pdTRUE) {
     cache.detection = detClass;
     cache.confidence = maxConf;
@@ -384,7 +447,6 @@ void runMaskDetection() {
     cache.is_ambiguous = is_ambiguous;
     if (noMaskDetected) cache.alert_count++;
     
-    // Also update globals for compatibility
     currentDetection = detClass;
     currentConfidence = maxConf;
     maskConfidence = tempMask;
@@ -395,7 +457,6 @@ void runMaskDetection() {
     xSemaphoreGive(detectionMutex);
   }
   
-  // Console output
   Serial.println("\n╔═════════════════════════════════════╗");
   Serial.printf("║ 🎯 DETECTION: %-21s║\n", detClass.c_str());
   Serial.printf("║ 📊 Confidence: %-4.1f%%              ║\n", maxConf * 100);
@@ -407,7 +468,6 @@ void runMaskDetection() {
   }
   Serial.println("╚═════════════════════════════════════╝");
   
-  // LED control
   if (noMaskDetected && !is_ambiguous) {
     if (!ledState) {
       ledState = true;
@@ -422,7 +482,6 @@ void runMaskDetection() {
     }
   }
   
-  // Summary every 10 inferences
   if (inferenceCounter % 10 == 0) {
     Serial.println("\n╔════════════════════════════════════════╗");
     Serial.println("║      📊 10-INFERENCE SUMMARY           ║");
@@ -434,18 +493,14 @@ void runMaskDetection() {
     Serial.println("╚════════════════════════════════════════╝\n");
   }
   
-  // Cleanup
   free(snapshot_buf);
   snapshot_buf = nullptr;
 }
 
-// ==================== SYSTEM HEALTH MONITORING ====================
+// ==================== SYSTEM HEALTH ====================
 void checkSystemHealth() {
   uint32_t current_heap = ESP.getFreeHeap();
-  
-  if (current_heap < minHeapEver) {
-    minHeapEver = current_heap;
-  }
+  if (current_heap < minHeapEver) minHeapEver = current_heap;
   
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║       🏥 SYSTEM HEALTH CHECK           ║");
@@ -460,15 +515,14 @@ void checkSystemHealth() {
   Serial.println("╚════════════════════════════════════════╝\n");
   
   if (current_heap < 100000) {
-    Serial.println("⚠️ WARNING: Low memory (<100KB) - consider restart");
+    Serial.println("⚠️ WARNING: Low memory (<100KB)");
   }
-  
   if (cameraErrorCount > 10) {
-    Serial.println("⚠️ WARNING: High camera error rate - check hardware");
+    Serial.println("⚠️ WARNING: High camera error rate");
   }
 }
 
-// ==================== INFERENCE TASK (Core 0) ====================
+// ==================== INFERENCE TASK ====================
 void inferenceTask(void * parameter) {
   Serial.println("✅ Inference task started on Core 0");
   delay(2000);
@@ -500,33 +554,50 @@ void handle_jpg_stream() {
   client.println("Access-Control-Allow-Origin: *");
   client.println();
   
+  int stream_error_count = 0;
+  
   while (client.connected()) {
     fb = esp_camera_fb_get();
     if (!fb) {
-      delay(30);
+      stream_error_count++;
+      Serial.printf("⚠️ Stream frame failed (error %d)\n", stream_error_count);
+      
+      if (stream_error_count >= 5) {
+        Serial.println("🔄 Stream camera recovery...");
+        esp_camera_deinit();
+        delay(200);
+        if (initCamera()) {
+          Serial.println("✅ Stream camera recovered");
+          stream_error_count = 0;
+        }
+      }
+      delay(100);
       continue;
     }
     
-    if (ENABLE_BLUR) {
-      blurJPEGFrame(fb);
+    if (stream_error_count > 0) stream_error_count = 0;
+    
+    // ALWAYS BLUR
+    blurJPEGFrame(fb);
+    
+    if (!client.write(_STREAM_BOUNDARY) ||
+        !client.printf(_STREAM_PART, fb->len) ||
+        !client.write(fb->buf, fb->len)) {
+      esp_camera_fb_return(fb);
+      break;
     }
     
-    client.print(_STREAM_BOUNDARY);
-    client.printf(_STREAM_PART, fb->len);
-    client.write(fb->buf, fb->len);
     esp_camera_fb_return(fb);
     fb = NULL;
-    
-    delay(20); // ~30 FPS
+    delay(20);
   }
   
   if (fb) esp_camera_fb_return(fb);
   Serial.println("📹 Stream ended");
 }
 
-// ==================== STATUS API (Lock-Free) ====================
+// ==================== STATUS API ====================
 void handleStatus() {
-  // NO MUTEX - always serve cached data for reliability
   unsigned long now = millis();
   
   String status = "{";
@@ -544,6 +615,8 @@ void handleStatus() {
   status += "\"cameraErrors\":" + String(cameraErrorCount) + ",";
   status += "\"timestamp\":" + String(now);
   status += "}";
+  
+  Serial.println("📊 Status API: " + status);
   
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -633,104 +706,28 @@ void handleDashboard() {
   html += "setTimeout(()=>{const o2=audioCtx.createOscillator(),g2=audioCtx.createGain();o2.connect(g2);g2.connect(audioCtx.destination);";
   html += "o2.frequency.value=700;o2.type='square';g2.gain.setValueAtTime(0.25,audioCtx.currentTime);";
   html += "g2.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+0.4);o2.start();o2.stop(audioCtx.currentTime+0.4);},200);}catch(e){}}";
-  html += "function update(){fetch('/status').then(r=>r.json()).then(d=>{";
+  html += "function update(){fetch('/status').then(r=>{if(!r.ok)throw new Error('Status fetch failed');return r.json();}).then(d=>{";
+  html += "console.log('📊 Update:',d);";
   html += "document.getElementById('dot').style.background='#4CAF50';";
   html += "if(d.alertCounter>lastAlert){beep();lastAlert=d.alertCounter;}";
   html += "const res=document.getElementById('detRes'),conf=document.getElementById('detConf'),card=document.getElementById('detCard'),ambig=document.getElementById('ambigBadge');";
-  html += "res.textContent=d.currentDetection;conf.textContent=(d.confidence*100).toFixed(1)+'% CONFIDENCE';";
+  html += "res.textContent=d.currentDetection||'Unknown';conf.textContent=((d.confidence||0)*100).toFixed(1)+'% CONFIDENCE';";
   html += "card.className='card detection-card ';";
   html += "if(d.isAmbiguous){card.classList.add('state-ambiguous');ambig.style.display='inline-block'}else{ambig.style.display='none';";
-  html += "if(d.currentDetection.toLowerCase().includes('no'))card.classList.add('state-danger');else card.classList.add('state-success')}";
-  html += "document.getElementById('maskBar').style.width=(d.maskConfidence*100)+'%';";
-  html += "document.getElementById('maskPct').textContent=(d.maskConfidence*100).toFixed(1)+'%';";
-  html += "document.getElementById('noMaskBar').style.width=(d.noMaskConfidence*100)+'%';";
-  html += "document.getElementById('noMaskPct').textContent=(d.noMaskConfidence*100).toFixed(1)+'%';";
-  html += "document.getElementById('count').textContent=d.noMaskCount;";
-  html += "document.getElementById('timer').textContent=d.secondsUntilReport;";
-  html += "document.getElementById('infCount').textContent=d.inferenceCount;";
-  html += "}).catch(e=>{console.error(e);document.getElementById('dot').style.background='#f44336';});}";
-  html += "setInterval(update,500);update();";
+  html += "const detLower=(d.currentDetection||'').toLowerCase();";
+  html += "if(detLower.includes('no')||detLower.includes('without'))card.classList.add('state-danger');else if(detLower.includes('mask'))card.classList.add('state-success')}";
+  html += "document.getElementById('maskBar').style.width=((d.maskConfidence||0)*100)+'%';";
+  html += "document.getElementById('maskPct').textContent=((d.maskConfidence||0)*100).toFixed(1)+'%';";
+  html += "document.getElementById('noMaskBar').style.width=((d.noMaskConfidence||0)*100)+'%';";
+  html += "document.getElementById('noMaskPct').textContent=((d.noMaskConfidence||0)*100).toFixed(1)+'%';";
+  html += "document.getElementById('count').textContent=d.noMaskCount||0;";
+  html += "document.getElementById('timer').textContent=d.secondsUntilReport||'--';";
+  html += "document.getElementById('infCount').textContent=d.inferenceCount||0;";
+  html += "}).catch(e=>{console.error('❌ Error:',e);document.getElementById('dot').style.background='#f44336';document.getElementById('detRes').textContent='CONNECTION ERROR';});}";
+  html += "setInterval(update,500);setTimeout(update,100);";
   html += "</script></body></html>";
   
   server.send(200, "text/html", html);
-}
-
-// ==================== CAMERA INITIALIZATION (OPTIMIZED) ====================
-bool initCamera() {
-  camera_config.ledc_channel = LEDC_CHANNEL_0;
-  camera_config.ledc_timer = LEDC_TIMER_0;
-  camera_config.pin_d0 = Y2_GPIO_NUM;
-  camera_config.pin_d1 = Y3_GPIO_NUM;
-  camera_config.pin_d2 = Y4_GPIO_NUM;
-  camera_config.pin_d3 = Y5_GPIO_NUM;
-  camera_config.pin_d4 = Y6_GPIO_NUM;
-  camera_config.pin_d5 = Y7_GPIO_NUM;
-  camera_config.pin_d6 = Y8_GPIO_NUM;
-  camera_config.pin_d7 = Y9_GPIO_NUM;
-  camera_config.pin_xclk = XCLK_GPIO_NUM;
-  camera_config.pin_pclk = PCLK_GPIO_NUM;
-  camera_config.pin_vsync = VSYNC_GPIO_NUM;
-  camera_config.pin_href = HREF_GPIO_NUM;
-  camera_config.pin_sscb_sda = SIOD_GPIO_NUM;
-  camera_config.pin_sscb_scl = SIOC_GPIO_NUM;
-  camera_config.pin_pwdn = PWDN_GPIO_NUM;
-  camera_config.pin_reset = RESET_GPIO_NUM;
-  camera_config.xclk_freq_hz = 20000000;
-  camera_config.pixel_format = PIXFORMAT_JPEG;
-  camera_config.frame_size = FRAMESIZE_QVGA;  // 320x240
-  camera_config.jpeg_quality = 12;  // IMPROVED: Better quality (was 15)
-  camera_config.fb_count = 2;
-  camera_config.fb_location = CAMERA_FB_IN_PSRAM;
-  camera_config.grab_mode = CAMERA_GRAB_LATEST;
-  
-  esp_err_t err = esp_camera_init(&camera_config);
-  if (err != ESP_OK) {
-    Serial.printf("❌ Camera init failed: 0x%x\n", err);
-    return false;
-  }
-  
-  // IMPROVED: Comprehensive sensor tuning for industrial environments
-  sensor_t *s = esp_camera_sensor_get();
-  
-  // Basic adjustments
-  s->set_brightness(s, 0);      // -2 to 2 (0=default)
-  s->set_contrast(s, 1);        // +1 to enhance edges
-  s->set_saturation(s, -1);     // Reduce saturation (clearer mask edges)
-  
-  // White balance (critical for consistent detection)
-  s->set_whitebal(s, 1);        // Enable auto white balance
-  s->set_awb_gain(s, 1);        // Auto white balance gain
-  s->set_wb_mode(s, 0);         // Auto mode
-  
-  // Exposure control (prevent blown-out faces)
-  s->set_exposure_ctrl(s, 1);   // Enable auto exposure
-  s->set_aec2(s, 1);            // Auto exposure algorithm
-  s->set_ae_level(s, 0);        // Auto exposure level (0=default)
-  s->set_aec_value(s, 300);     // Manual exposure time
-  
-  // Gain control (improve low-light performance)
-  s->set_gain_ctrl(s, 1);       // Enable auto gain
-  s->set_agc_gain(s, 5);        // Manual gain ceiling (0-30)
-  s->set_gainceiling(s, (gainceiling_t)2); // Max gain = 4x
-  
-  // Pixel correction (reduce noise)
-  s->set_bpc(s, 1);             // Black pixel correction
-  s->set_wpc(s, 1);             // White pixel correction
-  
-  // Gamma and lens correction
-  s->set_raw_gma(s, 1);         // Enable gamma curve
-  s->set_lenc(s, 1);            // Lens correction (vignetting)
-  
-  // Orientation
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);         // Flip for AI Thinker board
-  }
-  
-  Serial.println("✓ Camera initialized with industrial-grade optimization");
-  Serial.printf("  Sensor: %s (0x%02X)\n", 
-                s->id.PID == OV3660_PID ? "OV3660" : "OV2640", s->id.PID);
-  
-  return true;
 }
 
 // ==================== SETUP ====================
@@ -745,26 +742,20 @@ void setup() {
   Serial.println("║  GDPR & EU AI Act Compliant              ║");
   Serial.println("╚══════════════════════════════════════════╝\n");
   
-  // LED
   pinMode(LED_GPIO_NUM, OUTPUT);
   digitalWrite(LED_GPIO_NUM, LOW);
   Serial.println("✓ LED configured (GPIO 4)");
   
-  // Camera
   if (initCamera()) {
     is_initialised = true;
     Serial.println("✓ Camera initialized");
   } else {
     Serial.println("❌ CRITICAL: Camera initialization failed!");
-    Serial.println("   Check connections and power supply");
     return;
   }
   
-  // WiFi AP
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
-  
-  // Disable WiFi power saving for stability
   esp_wifi_set_ps(WIFI_PS_NONE);
   
   delay(1000);
@@ -772,12 +763,11 @@ void setup() {
   Serial.println("✓ Access Point Started");
   Serial.printf("  SSID: %s\n", AP_SSID);
   Serial.printf("  Password: %s\n", AP_PASSWORD);
-  Serial.printf("  IP Address: %s\n", ip.toString().c_str());
+  Serial.printf("  IP: %s\n", ip.toString().c_str());
   Serial.printf("\n📱 Dashboard: http://%s/\n", ip.toString().c_str());
   Serial.printf("📊 Status API: http://%s/status\n", ip.toString().c_str());
   Serial.printf("📹 Stream: http://%s/mjpeg/1\n\n", ip.toString().c_str());
   
-  // Web server
   server.on("/", HTTP_GET, handleDashboard);
   server.on("/mjpeg/1", HTTP_GET, handle_jpg_stream);
   server.on("/status", HTTP_GET, handleStatus);
@@ -787,12 +777,10 @@ void setup() {
   server.begin();
   Serial.println("✓ Web server started");
   
-  // Initialize timers
   lastCountReport = millis();
   lastInferenceTime = millis();
   lastHealthCheck = millis();
   
-  // Create mutex
   detectionMutex = xSemaphoreCreateMutex();
   if (!detectionMutex) {
     Serial.println("❌ CRITICAL: Failed to create mutex");
@@ -800,15 +788,24 @@ void setup() {
   }
   Serial.println("✓ Detection mutex created");
   
-  // Create inference task on Core 0
+  // Initialize cache with default values
+  cache.detection = "Initializing";
+  cache.confidence = 0.0;
+  cache.mask_conf = 0.0;
+  cache.nomask_conf = 0.0;
+  cache.timestamp = millis();
+  cache.alert_count = 0;
+  cache.is_ambiguous = false;
+  Serial.println("✓ Cache initialized");
+  
   BaseType_t task_created = xTaskCreatePinnedToCore(
     inferenceTask,
     "InferenceTask",
-    8192,  // Stack size
+    8192,
     NULL,
-    1,     // Priority
+    1,
     &inferenceTaskHandle,
-    0      // Core 0
+    0
   );
   
   if (task_created != pdPASS) {
@@ -817,13 +814,18 @@ void setup() {
   }
   Serial.println("✓ Inference task created on Core 0");
   
+  // Force first inference immediately
+  lastInferenceTime = millis() - INFERENCE_INTERVAL;
+  Serial.println("✓ First inference will trigger immediately");
+  
   Serial.println("\n╔══════════════════════════════════════════╗");
   Serial.println("║          🚀 SYSTEM READY!                ║");
   Serial.println("║                                          ║");
   Serial.println("║  Model: Edge Impulse CNN (INT8)         ║");
-  Serial.println("║  Accuracy: 94.4% (validation set)       ║");
-  Serial.println("║  Inference: ~551ms                       ║");
+  Serial.println("║  Accuracy: 95% (validation set)         ║");
+  Serial.println("║  Inference: ~650ms                       ║");
   Serial.println("║  Privacy: Zero cloud, zero storage      ║");
+  Serial.println("║  Auto-recovery: Enabled                 ║");
   Serial.println("║                                          ║");
   Serial.println("║  ⚠️  BIAS WARNING:                       ║");
   Serial.println("║  System tested primarily on Asian/      ║");
@@ -833,12 +835,10 @@ void setup() {
   Serial.println("╚══════════════════════════════════════════╝\n");
 }
 
-// ==================== MAIN LOOP (Core 1) ====================
+// ==================== MAIN LOOP ====================
 void loop() {
-  // Handle web server requests
   server.handleClient();
   
-  // 15-second violation report
   if (millis() - lastCountReport >= REPORT_INTERVAL) {
     Serial.println("\n╔════════════════════════════════════════╗");
     Serial.println("║       📊 15-SECOND REPORT              ║");
@@ -858,5 +858,5 @@ void loop() {
 
 // ==================== COMPILE-TIME CHECKS ====================
 #if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
-  #error "Invalid model for current sensor - ensure correct Edge Impulse export"
+  #error "Invalid model for current sensor"
 #endif
